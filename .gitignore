@@ -1,1 +1,5 @@
 __pycache__/
+cli_build
+*.sqlite
+*.nsys-rep
+*.csv
