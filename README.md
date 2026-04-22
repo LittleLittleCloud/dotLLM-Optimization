@@ -1,4 +1,4 @@
-# 提高llm的推理速度 - 以llama 3.1 8b int4 和dotLLM 为例
+# llm-inference-perf-guide: use llama 3.1 && dotLLM as an example
 
 ## 背景
 llama 3.1大家都很熟了，以下重点介绍dotLLM
@@ -73,11 +73,56 @@ $$
 | 引擎 | Windows 原生 | WSL2 | 备注 |
 |------|:---:|:---:|------|
 | **llama.cpp / Ollama** | ✅ | ✅ | 原生 Windows 支持最好，CUDA 直接可用 |
-| **ExLlamaV2** | ✅ | ✅ | pip 安装即可，Windows 原生 CUDA 支持 |
+| **ExLlamaV2** | ✅ | ✅ | pip 安装即可，Windows 原生 CUDA 支持（本次跳过） |
 | **vLLM** | ❌ | ✅ | 仅 Linux，需通过 WSL2 使用 |
-| **TensorRT-LLM** | ❌ | ✅ | 仅 Linux，需通过 WSL2/Docker 使用 |
+| **TensorRT-LLM** | ❌ | ✅ | 仅 Linux，**跳过**（见下方说明） |
 | **SGLang** | ❌ | ✅ | 仅 Linux，需通过 WSL2 使用 |
-| **MLC-LLM** | ✅ | ✅ | 有 Windows 预编译包 |
+| **MLC-LLM** | ✅ | ✅ | 有 Windows 预编译包（本次跳过） |
 | **dotLLM** (TODO 包含commit id) |
+
+> **TensorRT-LLM 跳过说明**: TRT-LLM v1.2.1 无法直接加载 GPTQ INT4 预量化 checkpoint（`hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4`）。
+> - `pytorch` backend: fused QKV weight loading AssertionError（GPTQ权重格式不兼容）
+> - `tensorrt` backend: 不支持 `desc_act=True` 的 GPTQ quantization_config
+> - `_autodeploy` backend: `torch.export` dimension specialization 冲突
+>
+> 需要从 FP16 模型手动构建 TRT engine（FP16模型16GB + KV cache 在 24GB 4090 上空间紧张），故本次跳过。
+
+推理参数如下
+- batch size = 1
+- prefill length ≈ 2k tokens
+- decode length = 2k tokens (max_tokens=2048)
+- temperature = 0 (deterministic)
+- 每引擎跑3次取平均
+
+### Benchmark 结果
+
+| 引擎 | Decode (tokens/s) | Prefill (tokens/s) | TTFT (ms) | 总时间 (s) | 备注 |
+|------|---:|---:|---:|---:|------|
+| **SGLang** | **143.6** | **9,669** | **225** | **15.1** | gptq_marlin kernel, `--disable-radix-cache` |
+| **Ollama** | 127.3 | 6,062 | 337 | 16.4 | llama.cpp backend, `llama3.1:8b-instruct-q4_0` |
+| **vLLM** | 115.6 | 5,759 | 356 | 18.1 | run 1-2 avg (run 0 有 torch.compile JIT 开销) |
+| **dotLLM** | 17.0 | 1,081 | 2,013 | 130.4 | CUDA backend, Q4_K_M GGUF, 全部层 GPU offload |
+| *理论上限* | *252* | *10,325* | — | — | *RTX 4090, W4A16* |
+
+> **注**: SGLang/vLLM 使用 `hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4`（GPTQ 4bit, group_size=128）；Ollama 使用 `llama3.1:8b-instruct-q4_0`（llama.cpp Q4_0）；dotLLM 使用 `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf`。量化方式略有差异但均为 ~4bit。
+>
+> vLLM 的 run 0 因 torch.compile / CUDA graph JIT 编译导致 TTFT ~11s，故仅取 run 1-2 的稳定结果。
+
+### 与理论上限对比
+
+- **Decode**: SGLang 达到理论上限的 **57%**，Ollama **50%**，dotLLM 仅 **6.7%**
+- **Prefill**: SGLang 达到 W4A16 理论上限的 **94%**（！），Ollama **59%**，dotLLM **10.5%**
+
+dotLLM 与 Ollama 相比有 **~7.5× 的 decode 差距**，与最快的 SGLang 相比有 **~8.5× 差距**。这就是本文要优化的目标。
+
+### 为什么SGLang的prefill速度接近理论上限？
+因为SGLang使用了高效的Marlin kernel，带来三个关键优化点
+- fused dequant：将权重的反量化操作与矩阵乘法融合，减少内存访问和计算开销
+- 使用cp.async异步加载next tile，同时当前tile在tensor core上计算，减少显存访问等待时间
+- 高效tile mapping：根据GEMM维度自动选择最优tile size
+
+### 为什么接近的是FP16理论上限？
+- W4A16计算模式下，权重为INT4，计算为FP16，计算量等价于FP16 GEMM
+- 非matmul开销很小（例如RMSNorm，ROPE， SiLU等）
 
 ## dotLLM性能分析
